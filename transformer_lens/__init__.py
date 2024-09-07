@@ -11,6 +11,7 @@ from .HookedTransformerConfig import HookedTransformerConfig
 from .FactoredMatrix import FactoredMatrix
 from .ActivationCache import ActivationCache
 from .HookedTransformer import HookedTransformer
+from .HookedChameleon import HookedChameleon
 from .SVDInterpreter import SVDInterpreter
 from .HookedEncoder import HookedEncoder
 from .HookedEncoderDecoder import HookedEncoderDecoder

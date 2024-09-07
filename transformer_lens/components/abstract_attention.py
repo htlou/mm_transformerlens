@@ -311,6 +311,155 @@ class AbstractAttention(ABC, nn.Module):
                 + self.b_O
             )  # [batch, pos, d_model]
         return out
+    
+    def forward_with_attn_weights(
+        self,
+        query_input: Union[
+            Float[torch.Tensor, "batch pos d_model"],
+            Float[torch.Tensor, "batch pos head_index d_model"],
+        ],
+        key_input: Union[
+            Float[torch.Tensor, "batch kv_pos d_model"],
+            Float[torch.Tensor, "batch kv_pos head_index d_model"],
+            Float[torch.Tensor, "batch kv_pos kv_head_index d_model"],
+        ],
+        value_input: Union[
+            Float[torch.Tensor, "batch kv_pos d_model"],
+            Float[torch.Tensor, "batch kv_pos head_index d_model"],
+            Float[torch.Tensor, "batch kv_pos kv_head_index d_model"],
+        ],
+        past_kv_cache_entry: Optional[HookedTransformerKeyValueCacheEntry] = None,
+        additive_attention_mask: Optional[Float[torch.Tensor, "batch 1 1 kv_pos"]] = None,
+        attention_mask: Optional[Int[torch.Tensor, "batch offset_pos"]] = None,
+        position_bias: Optional[Float[torch.Tensor, "1 head_index pos kv_pos"]] = None,
+    ) -> Tuple[Float[torch.Tensor, "batch pos d_model"], Float[torch.Tensor, "batch head_index pos kv_pos"]]:
+        """
+        shortformer_pos_embed is only used if self.cfg.positional_embedding_type == "shortformer", else defaults to None and is irrelevant. See HookedTransformerConfig for more details
+        past_kv_cache_entry is an optional entry of past keys and values for this layer, only relevant if generating text. Defaults to None
+        additive_attention_mask is an optional mask to add to the attention weights. Defaults to None.
+        attention_mask is the attention mask for padded tokens. Defaults to None.
+        """
+
+        q, k, v = self.calculate_qkv_matrices(query_input, key_input, value_input)
+
+        if past_kv_cache_entry is not None:
+            # Appends the new keys and values to the cached values, and automatically updates the cache
+            kv_cache_pos_offset = past_kv_cache_entry.past_keys.size(1)
+            k, v = past_kv_cache_entry.append(k, v)
+        else:
+            # Not using a cache
+            kv_cache_pos_offset = 0
+
+        if self.cfg.positional_embedding_type == "rotary":
+            q = self.hook_rot_q(self.apply_rotary(q, kv_cache_pos_offset, attention_mask))
+            k = self.hook_rot_k(
+                self.apply_rotary(k, 0, attention_mask)
+            )  # keys are cached so no offset
+
+        if self.cfg.dtype not in [torch.float32, torch.float64]:
+            # If using 16 bits, increase the precision to avoid numerical instabilities
+            q = q.to(torch.float32)
+            k = k.to(torch.float32)
+
+        attn_scores = self.calculate_attention_scores(
+            q, k
+        )  # [batch, head_index, query_pos, key_pos]
+
+        if self.cfg.positional_embedding_type == "alibi":
+            query_ctx = attn_scores.size(-2)
+            # The key context length is the number of positions in the past - this includes all positions in the cache
+            key_ctx = attn_scores.size(-1)
+
+            # only recompute when necessary to increase efficiency.
+            if self.alibi is None or key_ctx > self.alibi.size(-1):
+                self.alibi = AbstractAttention.create_alibi_bias(
+                    self.cfg.n_heads, key_ctx, self.cfg.device
+                )
+
+            attn_scores += self.alibi[
+                :, :query_ctx, :key_ctx
+            ]  # [batch, head_index, query_pos, key_pos]
+        elif self.cfg.positional_embedding_type == "relative_positional_bias":
+            if position_bias is None:
+                if self.has_relative_attention_bias:
+                    raise ValueError("Positional bias is required for relative_positional_bias")
+                else:
+                    position_bias = torch.zeros(
+                        1,
+                        self.cfg.n_heads,
+                        attn_scores.shape[2],
+                        attn_scores.shape[3],
+                        device=attn_scores.device,
+                    )
+
+            attn_scores += position_bias
+        if self.cfg.attention_dir == "causal":
+            # If causal attention, we mask it to only attend backwards. If bidirectional, we don't mask.
+            attn_scores = self.apply_causal_mask(
+                attn_scores, kv_cache_pos_offset, attention_mask
+            )  # [batch, head_index, query_pos, key_pos]
+        if additive_attention_mask is not None:
+            attn_scores += additive_attention_mask
+
+        attn_scores = self.hook_attn_scores(attn_scores)
+        pattern = F.softmax(attn_scores, dim=-1)
+        pattern = torch.where(torch.isnan(pattern), torch.zeros_like(pattern), pattern)
+        pattern = self.hook_pattern(pattern)  # [batch, head_index, query_pos, key_pos]
+        pattern = pattern.to(self.cfg.dtype)
+        pattern = pattern.to(v.device)
+        z = self.calculate_z_scores(v, pattern)  # [batch, pos, head_index, d_head]
+        if not self.cfg.use_attn_result:
+            if self.cfg.load_in_4bit:
+                # call bitsandbytes method to dequantize and multiply
+                out = (
+                    bnb.matmul_4bit(
+                        z.reshape(z.shape[0], z.shape[1], self.cfg.d_head * self.cfg.n_heads),
+                        self.W_O.t(),
+                        # bias=self.W_O.t(),
+                        bias=None,
+                        quant_state=self.W_O.quant_state,
+                    )
+                    + self.b_O
+                )
+            else:
+                w = einops.rearrange(
+                    self.W_O, "head_index d_head d_model -> d_model (head_index d_head)"
+                )
+                out = F.linear(
+                    z.reshape(z.shape[0], z.shape[1], self.cfg.d_head * self.cfg.n_heads),
+                    w,
+                    self.b_O,
+                )
+        else:
+            # Explicitly calculate the attention result so it can be accessed by a hook
+            # This is off by default because it can easily eat through your GPU memory.
+            if self.cfg.load_in_4bit:
+                result = self.hook_result(
+                    bnb.matmul_4bit(
+                        z.reshape(z.shape[0], z.shape[1], self.cfg.d_head * self.cfg.n_heads),
+                        self.W_O.t(),
+                        bias=None,
+                        quant_state=self.W_O.quant_state,
+                    )
+                )
+            else:
+                w = einops.rearrange(
+                    self.W_O,
+                    "head_index d_head d_model -> d_model head_index d_head",
+                )
+                result = self.hook_result(
+                    einops.einsum(
+                        z,
+                        w,
+                        "... head_index d_head, d_model head_index d_head -> ... head_index d_model",
+                    )
+                )  # [batch, pos, head_index, d_model]
+            out = (
+                einops.reduce(result, "batch position index model->batch position model", "sum")
+                + self.b_O
+            )  # [batch, pos, d_model]
+        return out, pattern
+
 
     def calculate_qkv_matrices(
         self,

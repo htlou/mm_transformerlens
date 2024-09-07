@@ -30,3 +30,6 @@ from .mlps.moe import MoE
 from .transformer_block import TransformerBlock
 from .t5_attention import T5Attention
 from .t5_block import T5Block
+
+from .chameleon_attention import ChameleonAttention
+from .chameleon_block import ChameleonBlock
